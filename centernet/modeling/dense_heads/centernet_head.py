@@ -146,6 +146,8 @@ class CenterNetHead(nn.Module):
             feature = self.share_tower(feature)
             cls_tower = self.cls_tower(feature)
             bbox_tower = self.bbox_tower(feature)
+            # from IPython import embed
+            # embed()
             if not self.only_proposal:
                 clss.append(self.cls_logits(cls_tower))
             else:
@@ -160,3 +162,9 @@ class CenterNetHead(nn.Module):
             bbox_reg.append(F.relu(reg))
         
         return clss, bbox_reg, agn_hms
+    
+# [torch.Size([8, 256, 60, 60]),
+#  torch.Size([8, 256, 30, 30]),
+#  torch.Size([8, 256, 15, 15]),
+#  torch.Size([8, 256, 8, 8]),
+#  torch.Size([8, 256, 4, 4])]

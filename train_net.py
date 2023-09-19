@@ -142,6 +142,9 @@ def do_train(cfg, model, resume=False):
     if cfg.FP16:
         scaler = GradScaler()
 
+    # do_test(cfg, model)
+    # comm.synchronize()
+
     logger.info("Starting training from iteration {}".format(start_iter))
     with EventStorage(start_iter) as storage:
         step_timer = Timer()
@@ -183,8 +186,8 @@ def do_train(cfg, model, resume=False):
             data_timer.reset()
             scheduler.step()
 
-            if (cfg.TEST.EVAL_PERIOD > 0
-                # and iteration > 0
+            if (cfg.TEST.EVAL_PERIOD 
+                and iteration == 0
                 and iteration % cfg.TEST.EVAL_PERIOD == 0
                 and iteration != max_iter):
                 do_test(cfg, model)
@@ -220,7 +223,8 @@ def setup(args):
         distributed_rank=comm.get_rank(), name="detic")
     return cfg
 
-
+import ipdb
+@ipdb.iex
 def main(args):
     cfg = setup(args)
 

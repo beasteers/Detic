@@ -17,6 +17,7 @@ from detectron2.structures import Keypoints, PolygonMasks, BitMasks
 from fvcore.transforms.transform import TransformList
 from .custom_build_augmentation import build_custom_augmentation
 from .tar_dataset import DiskTarDataset
+from IPython import embed
 
 __all__ = ["CustomDatasetMapper"]
 
@@ -147,8 +148,11 @@ class CustomDatasetMapper(DatasetMapper):
         if "annotations" in dataset_dict:
             # USER: Modify this if you want to keep them for some reason.
             for anno in dataset_dict["annotations"]:
-                if not self.use_instance_mask:
-                    anno.pop("segmentation", None)
+                if 'segmentation' not in anno:
+                    print('inserting segmentation', anno)
+                    anno['segmentation'] = []
+                # if not self.use_instance_mask:
+                #     anno.pop("segmentation", None)
                 if not self.use_keypoint:
                     anno.pop("keypoints", None)
 

@@ -45,8 +45,7 @@ object_classes = [
 # Main dataset annotation file: ./path/to/dataset/egohos_train.json
 
 
-def create_dataset(image_root):
-    dataset_dicts = create_dataset_dict(image_root)
+def create_dataset(dataset_dicts):
     
     return {
         "info": {
@@ -64,7 +63,7 @@ def create_dataset(image_root):
             for a in d['annotations']
         ],
         "categories": [
-            {"id": i, "name": c}
+            {"id": i+1, "name": c}
             for i, c in enumerate(object_classes)
         ]
     }
@@ -80,10 +79,10 @@ def create_dataset_dict(image_root):
     
     # load annotations for each file
     dataset_dicts = []
-    for i, (fname_im, fname_mask) in tqdm.tqdm(enumerate(zip(img_fs, mask_fs)), desc='loading egohos...', total=len(img_fs)):
+    for i, (fname_im, fname_mask) in tqdm.tqdm(enumerate(zip(img_fs, mask_fs)), desc=f'loading {image_root}...', total=len(img_fs)):
         mask = cv2.imread(fname_mask, cv2.IMREAD_GRAYSCALE)
         dataset_dicts.append({
-            "file_name": fname_im,
+            "file_name": os.path.relpath(fname_im, image_root),
             "height": mask.shape[0],
             "width": mask.shape[1],
             "image_id": i,
@@ -94,6 +93,12 @@ def create_dataset_dict(image_root):
             # "caption_features": [],
             "annotations": _get_annotations(mask),
         })
+
+    i = 0
+    for d in dataset_dicts:
+        for a in d['annotations']:
+            a['id'] = i
+            i += 1
     return dataset_dicts
 
 
@@ -115,7 +120,7 @@ def _bool_mask_to_contour(mask):
     return [c for c in contours if cv2.contourArea(c) >= 2]
 
 
-def _contour_to_ann(contours, category_id=-1, **meta):
+def _contour_to_ann(contours, category_id=0, **meta):
     # given contours get the proper annotation structure
     if not contours:
         return {}
@@ -127,14 +132,17 @@ def _contour_to_ann(contours, category_id=-1, **meta):
         p for px in polys 
         for p in (px.geoms if isinstance(px, MultiPolygon) else [px])
     ])
+    x1, y1, x2, y2 = multi_poly.bounds
     return {
-        "category_id": category_id,
+        "category_id": category_id+1,
         "segmentation": [
             np.array(poly.exterior.coords).ravel().tolist()
             for poly in multi_poly.geoms
         ],
-        "bbox": multi_poly.bounds, 
-        "bbox_mode": BoxMode.XYXY_ABS,
+        "iscrowd": 0,
+        "bbox": [x1, y1, x2-x1, y2-y1], 
+        # "bbox_mode": BoxMode.XYXY_ABS,
+        "bbox_mode": BoxMode.XYWH_ABS,
         "area": multi_poly.area,
         **meta
     }
@@ -169,26 +177,54 @@ def get_zs_weight(classes):
 
 
 
-
+# ln -s /scratch/work/ptg/EGOHOS datasets/egohos
 
 # Register different splits
 
-def main(data_root, out_path, name='egohos'):
+DATA_ROOT = 'datasets/egohos'
+
+def main(data_root=DATA_ROOT, out_path=DATA_ROOT, name='egohos'):
     # create text-embedding weights file
     np.save("datasets/metadata/egohos.npy", get_zs_weight(object_classes))
 
     for split in os.listdir(data_root):
+        if not os.path.isdir(os.path.join(data_root, split)): 
+            continue
         split_name = f'{name}_{split}'
 
         # create COCO json
-        dataset = create_dataset(os.path.join(data_root, split), split)
+        image_root = os.path.join(data_root, split)
+        dataset_dicts = create_dataset_dict(image_root)
+        dataset = create_dataset(dataset_dicts)
         with open(os.path.join(out_path, f'{split_name}.json'), 'w') as f:
-            json.dump(f, dataset)
+            json.dump(dataset, f)
 
         # create categories file
-        class_image_count = get_class_counts(dataset)
+        class_image_count = get_class_counts(dataset_dicts)
         with open(f"datasets/metadata/{split_name}_cat_count.json", 'w') as f:
             json.dump(class_image_count, f)
+
+        desc_dataset(dataset)
+
+def desc_dataset(dataset):
+    if isinstance(dataset, str):
+        dataset = json.load(open(dataset))
+    from IPython import embed
+    import pandas as pd
+    df = pd.DataFrame([
+        {k:d[k] for k in ['image_id', 'category_id']}
+        for d in dataset['annotations']
+    ])
+    ids = {d['id'] for d in dataset['images']}
+    cats = {c['id']: c['name'] for c in dataset['categories']}
+    df['category_id'] = df.category_id.apply(lambda i: cats[i])
+    counts = df.groupby('image_id').category_id.value_counts().unstack().fillna(0).value_counts()
+    # for k, c in counts.iterrows():
+    #     print(k, c)
+    print(counts)
+    print(ids-set(df.image_id.unique()))
+    print(set(df.image_id.unique()) - ids)
+    # embed()
 
 
 if __name__ == '__main__':

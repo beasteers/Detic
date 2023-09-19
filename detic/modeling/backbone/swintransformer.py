@@ -621,6 +621,7 @@ class SwinTransformer(Backbone):
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
                 x_out = norm_layer(x_out)
+                print(x_out.shape, H, W, Wh, Ww)
 
                 out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 # outs.append(out)

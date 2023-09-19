@@ -70,6 +70,10 @@ def add_detic_config(cfg):
     _C.MODEL.TIMM.FREEZE_AT = 0
     _C.MODEL.TIMM.PRETRAINED = False
     _C.MODEL.DATASET_LOSS_WEIGHT = []
+
+    _C.MODEL.DINO = CN()
+    _C.MODEL.DINO.SIZE = 'S' # 'S', 'B', 'L', 'G'
+    _C.MODEL.DINO.OUT_FEATURES = (1,)
     
     # Multi-dataset dataloader
     _C.DATALOADER.DATASET_RATIO = [1, 1] # sample ratio

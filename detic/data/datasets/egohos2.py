@@ -238,8 +238,8 @@ def custom_load_json(image_root, meta, name, split, class_offset=0):
                             print(x)
                         counts[c][x] = counts[c].get(x, 0) + 1
     class_image_count = [{'id': k, 'image_count': c} for k, c in counts['category_id'].items()]
-    # if not hasattr(meta, 'class_image_count'):
-    meta.class_image_count = class_image_count
+    if not hasattr(meta, 'class_image_count'):
+        meta.class_image_count = class_image_count
 
     # create text-embedding weights file
     zs_path = f"datasets/metadata/{name}.npy"
