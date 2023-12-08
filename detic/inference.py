@@ -20,6 +20,7 @@ from detectron2.modeling.roi_heads.cascade_rcnn import _ScaleGradient
 from detectron2.data import MetadataCatalog
 from detectron2.utils.file_io import PathManager
 from detectron2.utils.events import get_event_storage
+from detectron2.modeling.postprocessing import detector_postprocess
 
 # Detic libraries
 # detic_path = os.getenv('DETIC_PATH') or 'Detic'
@@ -58,9 +59,10 @@ device = (
 
 DEFAULT_PROMPT = 'a {}'
 
-CHECKPOINT = 'https://dl.fbaipublicfiles.com/detic/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.pth'
-CONFIG = "configs/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.yaml"
-
+# CHECKPOINT = 'https://dl.fbaipublicfiles.com/detic/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.pth'
+# CONFIG = "configs/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.yaml"
+# CHECKPOINT = 'https://dl.fbaipublicfiles.com/detic/Detic_LI_CLIP_SwinB_896b32_4x_ft4x_max-size.pth'
+# CONFIG = "configs/Detic_LI_CLIP_SwinB_896b32_4x_ft4x_max-size.yaml"
 # from .data.datasets import egohos
 # CHECKPOINT = 'output/Detic/Detic_EGOHOS_CLIP_SwinB_896b32_4x_ft4x_max-size/model_0009999.pth'
 # CONFIG = "configs/Detic_EGOHOS_CLIP_SwinB_896b32_4x_ft4x_max-size.yaml"
@@ -69,6 +71,10 @@ VERSIONS = {
     None: (
         'https://dl.fbaipublicfiles.com/detic/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.pth',
         'configs/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.yaml'
+    ),
+    'LI': (
+        'https://dl.fbaipublicfiles.com/detic/Detic_LI_CLIP_SwinB_896b32_4x_ft4x_max-size.pth',
+        'configs/Detic_LI_CLIP_SwinB_896b32_4x_ft4x_max-size.yaml'
     ),
     'egohos': (
         'output/Detic/Detic_EGOHOS_CLIP_SwinB_896b32_4x_ft4x_max-size/model_0133999.pth',
@@ -109,6 +115,7 @@ class Detic(nn.Module):
             self, vocab=None, conf_threshold=0.5, box_conf_threshold=0.5, 
             masks=False, one_class_per_proposal=True, patch_for_embeddings=True, 
             prompt=DEFAULT_PROMPT, device=device, config=None, checkpoint=None,
+            max_size=None,
     ):
         super().__init__()
         self.cfg = cfg = get_cfg()
@@ -120,13 +127,17 @@ class Detic(nn.Module):
             vocab = [x for x in vocab if x and not x.startswith(';')]
 
         # get latest checkpoint for that config (if it exists)
-        if config and not checkpoint:
-            checkpoint = (glob.glob(os.path.join('output/Detic', os.path.splitext(os.path.basename(config))[0], 'model_*.pth')) or [None])[0]
+        if config in VERSIONS:
+            chk, config = VERSIONS[config]
+            checkpoint = checkpoint or chk
+        if config:
+            checkpoint = checkpoint or (glob.glob(os.path.join('output/Detic', os.path.splitext(os.path.basename(config))[0], 'model_*.pth')) or [None])[0]
 
         # get default config/checkpoint for that vocab
-        _ch, _cf = (VERSIONS.get(vocab) if isinstance(vocab, str) else None) or VERSIONS[None]
-        config = config or _cf
-        checkpoint = checkpoint or _ch
+        # _ch, _cf = (VERSIONS.get(vocab) if isinstance(vocab, str) else None) or VERSIONS[None]
+        # _ch, _cf = VERSIONS[config]
+        # config = config or _cf
+        # checkpoint = checkpoint or _ch
         print(checkpoint)
 
         cfg.merge_from_file(os.path.join(detic_path, config))
@@ -137,6 +148,8 @@ class Detic(nn.Module):
         cfg.MODEL.MASK_ON = masks
         cfg.MODEL.DEVICE=device # uncomment this to use cpu-only mode
         cfg.MODEL.ROI_BOX_HEAD.CAT_FREQ_PATH = os.path.join(detic_path, cfg.MODEL.ROI_BOX_HEAD.CAT_FREQ_PATH)
+        if max_size:
+            cfg.INPUT.MAX_SIZE_TEST = max_size
         # print(cfg)
         self.predictor = DefaultPredictor(cfg)
         self.cfg = cfg
@@ -173,10 +186,13 @@ class Detic(nn.Module):
 
     # ---------------------------------- Compute --------------------------------- #
 
+    def build_query(self, im):
+        return DeticQuery(self, im)
+
     def forward(self, im, boxes=None, classifier=None):
         out = self.predictor(im, boxes=boxes, classifier=classifier)
-        cid = out['instances'].pred_classes.detach().int().cpu().numpy()
-        out['instances'].pred_labels = self.labels[cid]
+        # cid = out['instances'].pred_classes.detach().int().cpu().numpy()
+        # out['instances'].pred_labels = self.labels[cid]
         return out
 
     def encode_features(self, batched_inputs):
@@ -232,12 +248,95 @@ def _jitter(self, c):
 Visualizer._jitter = _jitter
 
 
+class DeticQuery:
+    proposals = None
+    def __init__(self, model, image):
+        self.wrapper = model
+        self.model = model.predictor.model
+        self.image = image
+        self.batched_inputs = self.wrapper.predictor.preprocess_image(image)
+        self.images = self.model.preprocess_image(self.batched_inputs)
+        self.features = self.model.backbone(self.images.tensor)
+
+    def get_proposals(self):
+        if self.proposals is None:
+            self.proposals, _ = self.model.proposal_generator(
+                self.images, self.features, None)
+        return self.proposals
+
+    def detect(self, classifier=None, conf_threshold=None, labels=None, roi_heads=None, **kw):
+        if roi_heads is None:
+            roi_heads = self.model.roi_heads
+        results, _ = roi_heads(
+            self.images, self.features, self.get_proposals(), 
+            classifier_info=(classifier, None, None), 
+            score_threshold=conf_threshold, **kw)
+        return self._postprocess(results, labels)
+
+    def predict(self, boxes, classifier=None, labels=None):
+        proposals = self.model.boxes_to_proposals(self.batched_inputs, [boxes])
+        results = self.model.roi_heads.classify_boxes(self.features, proposals, classifier)
+        return self._postprocess(results, labels)
+
+    def _postprocess(self, instances, labels=None):
+        # results = self.model._postprocess(
+        #     results, self.batched_inputs, self.images.image_sizes)
+        results = []
+        for results_per_image, input_per_image, image_size in zip(
+            instances, self.batched_inputs, self.images.image_sizes
+        ):
+            height = input_per_image.get("height", image_size[0])
+            width = input_per_image.get("width", image_size[1])
+            r = detector_postprocess(results_per_image, height, width)
+            results.append({"instances": r})
+        results = results[0]
+        if labels is not None:
+            results['instances'].pred_labels = labels[results['instances'].pred_classes.int().cpu().numpy()]
+            if results['instances'].has('topk_classes'):
+                labelsx = np.concatenate([labels, np.array([''])])
+                results['instances'].topk_labels = labelsx[results['instances'].topk_classes.int().cpu().numpy()]
+        return results
+
+    # def inference(
+    #     self,
+    #     batched_inputs: Tuple[Dict[str, torch.Tensor]],
+    #     boxes: Optional[List[torch.Tensor]] = None,
+    #     classifier: Optional[torch.Tensor] = None,
+    #     score_threshold: float = None,
+    #     do_postprocess: bool = True,
+    # ):
+    #     assert not self.training
+    #     # assert detected_instances is None
+
+    #     images = self.preprocess_image(batched_inputs)
+    #     features = self.backbone(images.tensor)
+    #     if boxes is not None:
+    #         # scale boxes to resized image
+    #         proposals = self._boxes_to_proposals(batched_inputs, boxes)
+    #         scores = self.roi_heads.classify_boxes(features, proposals, classifier)
+    #         return scores
+
+    #     proposals, _ = self.proposal_generator(images, features, None)
+    #     results, _ = self.roi_heads(
+    #         images, features, proposals, 
+    #         classifier_info=(classifier, None, None), 
+    #         score_threshold=score_threshold)
+    #     if do_postprocess:
+    #         assert not torch.jit.is_scripting(), \
+    #             "Scripting is not supported for postprocess."
+    #         return CustomRCNN._postprocess(
+    #             results, batched_inputs, images.image_sizes)
+    #     else:
+    #         return results
+
+
 from torch.nn import functional as F
 # from detic.modeling.meta_arch.custom_rcnn import CustomRCNN
 from detic.modeling.roi_heads.detic_roi_heads import DeticCascadeROIHeads
 from detic.modeling.roi_heads.detic_fast_rcnn import DeticFastRCNNOutputLayers
 from detic.modeling.roi_heads.zero_shot_classifier import ZeroShotClassifier
-from detectron2.modeling.roi_heads.fast_rcnn import fast_rcnn_inference
+# from detectron2.modeling.roi_heads.fast_rcnn import fast_rcnn_inference
+from detic.modeling.roi_heads.fast_rcnn_inference import fast_rcnn_inference
 
 class DeticCascadeROIHeads2(DeticCascadeROIHeads):
     # xx How to get box features given a box
@@ -263,7 +362,8 @@ class DeticCascadeROIHeads2(DeticCascadeROIHeads):
     #     scores = [s.mean(1).round(decimals=3) for s in stage_scores]
     #     return scores
 
-    def _forward_box(self, features, proposals, targets=None, ann_type='box', classifier_info=(None,None,None)):
+    use_asymmetric_nms = False
+    def _forward_box(self, features, proposals, targets=None, ann_type='box', classifier_info=(None,None,None), score_threshold=None, asymmetric_nms=None):
         # get image and object metadata from proposals
         k = 'scores' if len(proposals) > 0 and proposals[0].has('scores') else 'objectness_logits'
         proposal_scores = [p.get(k) for p in proposals]
@@ -293,9 +393,9 @@ class DeticCascadeROIHeads2(DeticCascadeROIHeads):
             box_features = _ScaleGradient.apply(box_features, 1.0 / self.num_cascade_stages)
             # several CNN>norm>relu layers
             box_features = self.box_head[k](box_features)
-            # store 1024 features on the proposals
-            for feat, p in zip(box_features.split([len(p) for p in proposals], dim=0), proposals):
-                p.feat = feat
+            # # store 1024 features on the proposals
+            # for feat, p in zip(box_features.split([len(p) for p in proposals], dim=0), proposals):
+            #     p.feat = feat
 
             # predict classes and regress boxes
             predictor = self.box_predictor[k]
@@ -324,24 +424,39 @@ class DeticCascadeROIHeads2(DeticCascadeROIHeads):
         scores = [s.mean(1).round(decimals=2) for s in stage_scores]
         # if self.mult_proposal_score:
         #     scores = [(s ** 0.8) * (ps[:, None] ** 0.2) for s, ps in zip(scores, proposal_scores)]
-        if self.one_class_per_proposal:
-            scores = [s * (s == s[:, :-1].max(dim=1)[0][:, None]).float() for s in scores]
+        # if self.one_class_per_proposal:
+        #     scores = [s * (s == s[:, :-1].max(dim=1)[0][:, None]).float() for s in scores]
+        # if int(self.one_class_per_proposal) == 1:
+        #     scores = [s * (s == s[:, :-1].max(dim=1)[0][:, None]).float() for s in scores]
+        # elif int(self.one_class_per_proposal) > 1:
+        #     for i, s in enumerate(scores):
+        #         ss = torch.zeros_like(s)
+        #         idxs = torch.topk(s, k=self.one_class_per_proposal).indices
+        #         ss[idxs] = s[idxs]
+        #         scores[i] = ss
 
         # down-select proposals
         # clip boxes, filter threshold, nms
         pred_instances, filt_idxs = fast_rcnn_inference(
             boxes, scores, image_sizes,
-            predictor.test_score_thresh,
-            predictor.test_nms_thresh,
-            predictor.test_topk_per_image,
+            score_thresh=predictor.test_score_thresh if score_threshold is None else score_threshold,
+            nms_thresh=predictor.test_nms_thresh,
+            topk_per_image=predictor.test_topk_per_image,
+            topk_per_box=self.one_class_per_proposal,
+            asymmetric=self.use_asymmetric_nms if asymmetric_nms is None else asymmetric_nms
         )
+
         # ++ add clip features and box scores to instances [N boxes x 512]
-        pred_instances[0].stage_scores = stage_scores[0][filt_idxs]
-        pred_instances[0].raw_features = box_features[filt_idxs]
-        # pred_instances[0].raw_features = feats_per_image[0][filt_idxs]
-        pred_instances[0].clip_features = cls_feats[filt_idxs]
-        if self.mult_proposal_score:
-            pred_instances[0].box_scores = proposal_scores[0][filt_idxs]
+        box_features = box_features.split([len(p) for p in proposals], dim=0)
+        cls_feats = cls_feats.split([len(p) for p in proposals], dim=0)
+        for i in range(len(pred_instances)):
+            pred_instances[i].pred_scores = scores[i][filt_idxs][:, :-1]
+            pred_instances[i].stage_scores = stage_scores[i][filt_idxs][:, :, :-1]
+            pred_instances[i].raw_features = box_features[i][filt_idxs]
+            # pred_instances[i].raw_features = feats_per_image[i][filt_idxs]
+            pred_instances[i].clip_features = cls_feats[i][filt_idxs]
+            if self.mult_proposal_score:
+                pred_instances[i].box_scores = proposal_scores[i][filt_idxs]
         return pred_instances
     
 
@@ -373,30 +488,6 @@ class DeticCascadeROIHeads2(DeticCascadeROIHeads):
 
 
 
-class Query:
-    def __init__(self, proposals):
-        self.proposals = proposals
-
-        k = 'scores' if len(proposals) > 0 and proposals[0].has('scores') else 'objectness_logits'
-        self.proposal_scores = [p.get(k) for p in proposals]
-        self.objectness_logits = [p.objectness_logits for p in proposals]
-        self.image_sizes = [x.image_size for x in proposals]
-
-    def encode_box_features(self):
-        # Run stage - get features per box
-        pool_boxes = [x.proposal_boxes for x in self.proposals]
-        # pools features using boxes
-        box_features = self.box_pooler(features, pool_boxes)
-        box_features = _ScaleGradient.apply(box_features, 1.0 / self.num_cascade_stages)
-        # several CNN>norm>relu layers
-        box_features = self.box_head[k](box_features)
-
-    def cascade_boxes(self):
-        pass
-
-
-
-
 class DeticFastRCNNOutputLayers2(DeticFastRCNNOutputLayers):
     def class_pred(self, x, classifier_info=(None,None,None)):
         if x.dim() > 2:
@@ -423,9 +514,13 @@ class DeticFastRCNNOutputLayers2(DeticFastRCNNOutputLayers):
 
 
 class ZeroShotClassifier2(ZeroShotClassifier):
-    dist_scale = 1
+    cls_weight = 1
+    cls_bias = 0
     def prepare_classifier(self, classifier):
-        zs_weight = classifier.permute(1, 0).contiguous() # D x C'
+        # classifier = classifier.permute(1, 0)
+        if self.linear.weight.shape[0] != classifier.shape[0] and self.linear.weight.shape[1] == classifier.shape[0]:
+            classifier = classifier.permute(1, 0)
+        zs_weight = classifier.contiguous() # D x C'
         if self.norm_weight:
             zs_weight = F.normalize(zs_weight, p=2, dim=0)
         return zs_weight
@@ -433,11 +528,13 @@ class ZeroShotClassifier2(ZeroShotClassifier):
     def get_classifier(self, classifier=None):
         if classifier is None:
             classifier = self.zs_weight
-        # else:
-        #     classifier = self.prepare_classifier(classifier)
-        if self.linear.weight.shape[0] != classifier.shape[0] and self.linear.weight.shape[1] == classifier.shape[0]:
-            classifier = self.linear(classifier.permute(1, 0)).permute(1, 0)
-        assert self.linear.weight.shape[0] == classifier.shape[0], f'{self.linear.weight.shape} != {classifier.shape}'
+        else:
+            classifier = self.prepare_classifier(classifier)
+        w = self.linear.weight
+        # if w.shape[0] != classifier.shape[0] and w.shape[1] == classifier.shape[0]:
+        #     classifier = self.linear(classifier.permute(1, 0)).permute(1, 0)
+        assert w.shape[0] == classifier.shape[0], f'{w.shape} != {classifier.shape}'
+        
         return classifier  # D x C'
     
     def encode_features(self, x):
@@ -455,10 +552,101 @@ class ZeroShotClassifier2(ZeroShotClassifier):
         x, _ = self.encode_features(x)
         zs_weight = self.get_classifier(classifier)
         T = self.norm_temperature if self.norm_weight else 1
-        y = torch.mm(T * x, zs_weight) * self.dist_scale
-        if self.use_bias:
-            y = y + self.cls_bias
-        return y, x  # ++ add x_features
+        y = torch.mm(T * x, zs_weight) * self.cls_weight + self.cls_bias
+        return y, x
+
+
+
+# def _asymmetric_nms(boxes, scores, iou_threshold):
+#     boxes = np.array(boxes)
+#     scores = np.array(scores)
+
+#     # Sort boxes by their confidence scores in descending order
+#     indices = np.argsort(scores)[::-1]
+#     boxes = boxes[sorted_indices]
+#     scores = scores[sorted_indices]
+
+#     selected_indices = []
+#     while len(boxes) > 0:
+#         # Pick the box with the highest confidence score
+#         b = boxes[0]
+#         selected_indices.append(indices[0])
+
+#         # Calculate IoU between the picked box and the remaining boxes
+#         intersection_area = (
+#             np.maximum(0, np.minimum(b[2], boxes[1:, 2]) - np.maximum(b[0], boxes[1:, 0])) * 
+#             np.maximum(0, np.minimum(b[3], boxes[1:, 3]) - np.maximum(b[1], boxes[1:, 1]))
+#         )
+#         smaller_box_area = np.minimum(
+#             (b[2] - b[0]) * (b[3] - b[1])
+#             (boxes[1:, 2] - boxes[1:, 0]) * (boxes[1:, 3] - boxes[1:, 1])
+#         )
+#         iou = intersection_area / (smaller_box_area + 1e-7)
+
+#         # Filter out boxes with IoU above the threshold
+#         filtered_indices = np.where(iou <= iou_threshold)[0]
+#         indices = indices[filtered_indices + 1]
+#         boxes = boxes[filtered_indices + 1]
+#         scores = scores[filtered_indices + 1]
+
+#     return selected_indices
+
+
+def asymmetric_nms_instances(instances):
+    new_instances = []
+    new_indices = []
+    for inst in instances:
+        result = Instances(image_shape)
+        result.pred_boxes = Boxes(boxes)
+        indices, overlap_indices = asymmetric_nms(boxes, scores, iou_threshold)
+    return new_instances, indices
+
+
+def asymmetric_nms(boxes, scores, iou_threshold=0.9):
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+
+    # Sort boxes by their confidence scores in descending order
+    # indices = np.argsort(area)[::-1]
+    indices = np.argsort(scores)[::-1]
+    boxes = boxes[indices]
+    scores = scores[indices]
+
+    selected_indices = []
+    overlap_indices = []
+    while len(boxes) > 0:
+        # Pick the box with the highest confidence score
+        b = boxes[0]
+        selected_indices.append(indices[0])
+
+        # Calculate IoU between the picked box and the remaining boxes
+        intersection_area = (
+            np.maximum(0, np.minimum(b[2], boxes[1:, 2]) - np.maximum(b[0], boxes[1:, 0])) * 
+            np.maximum(0, np.minimum(b[3], boxes[1:, 3]) - np.maximum(b[1], boxes[1:, 1]))
+        )
+        # smaller_box_area = np.minimum(
+        #     (b[2] - b[0]) * (b[3] - b[1]),
+        #     (boxes[1:, 2] - boxes[1:, 0]) * (boxes[1:, 3] - boxes[1:, 1])
+        # )
+        smaller_box_area = np.minimum(area[0], area[1:])
+        iou = intersection_area / (smaller_box_area + 1e-7)
+
+        # Filter out boxes with IoU above the threshold
+        overlap_indices.append(np.where(iou > iou_threshold)[0])
+        filtered_indices = np.where(iou <= iou_threshold)[0]
+        indices = indices[filtered_indices + 1]
+        boxes = boxes[filtered_indices + 1]
+        scores = scores[filtered_indices + 1]
+        area = area[filtered_indices + 1]
+
+    return selected_indices, overlap_indices
+
+
+
+
+
+
 
 
 def load_classifier(
@@ -469,6 +657,7 @@ def load_classifier(
         device=device, 
         norm_weight=True,
         z_dim=512,
+        prepare=True,
 ):
     # default vocab
     if vocab is None:
@@ -485,7 +674,9 @@ def load_classifier(
     if isinstance(vocab, torch.Tensor):
         assert vocab.ndim == 2 and vocab.shape[1] == z_dim, f"Expected vocab shape (N, {z_dim})."
         if thing_classes is None:
-            thing_classes = list(range(vocab.shape[0]))
+            thing_classes = [f'{i}' for i in range(vocab.shape[0])]
+            if metadata_name is None:
+                metadata_name = f'custom{id(vocab)}'
         classifier = vocab.permute(1, 0)
 
     # text queries
@@ -513,6 +704,7 @@ def load_classifier(
     # build metadata
     metadata_name = metadata_name or '__vocab:' + ','.join(thing_classes)
     metadata = MetadataCatalog.get(metadata_name)
+    print(metadata_name, metadata)
     try:
         if thing_classes is not None:
             metadata.thing_classes = list(thing_classes)
@@ -520,7 +712,9 @@ def load_classifier(
     except (AttributeError, AssertionError):
         pass
 
-    return prepare_classifier(classifier, device, norm_weight), metadata, metadata_name
+    if prepare:
+        classifier = prepare_classifier(classifier, device, norm_weight)
+    return classifier, metadata, metadata_name
 
 def prepare_classifier(zs_weight, device=None, norm_weight=True):
     if isinstance(zs_weight, str):
@@ -548,8 +742,8 @@ def reset_cls_test(model, cls_path, num_classes):
 
 import supervision as sv
 class Visualizer:
-    def __init__(self, model) -> None:
-        self.model = model
+    def __init__(self, labels) -> None:
+        self.labels = labels
         self.ba = sv.BoxAnnotator(text_scale=0.4, text_padding=1)
         self.ma = sv.MaskAnnotator()
 
@@ -561,18 +755,36 @@ class Visualizer:
             class_id=outputs["instances"].pred_classes.cpu().numpy().astype(int),
         )
 
-    def draw(self, frame, detections):
-        labels = [
-            f"{self.model.labels[class_id]} {confidence:0.2f}"
-            for _, _, confidence, class_id, _
-            in detections
-        ]
-        # frame = self.ma.annotate(scene=frame, detections=detections)
+    def draw(self, frame, detections, labels):
+        # labels = [
+        #     f"{self.labels[class_id].split(' ')[0]} {confidence:0.2f}"
+        #     for _, _, confidence, class_id, _
+        #     in detections
+        # ]
+        frame = self.ma.annotate(scene=frame, detections=detections)
         frame = self.ba.annotate(scene=frame, detections=detections, labels=labels)
         return frame
 
 
-def run(src, vocab, out_file=True, size=480, fps_down=1, **kw):
+def as_detections(outputs, labels):
+    detections = sv.Detections(
+        xyxy=outputs["instances"].pred_boxes.tensor.cpu().numpy(),
+        mask=outputs["instances"].pred_masks.cpu().numpy() if hasattr(outputs["instances"], 'pred_masks') else None,
+        confidence=outputs["instances"].scores.cpu().numpy(),
+        class_id=outputs["instances"].pred_classes.cpu().numpy().astype(int),
+    )
+    labels = [
+        f"{labels[class_id].split(' ')[0]} {confidence:0.2f}"
+        for _, _, confidence, class_id, _
+        in detections
+    ]
+    return detections, labels
+
+
+# import ipdb
+# @ipdb.iex
+@torch.no_grad()
+def run(src, vocab, out_file=True, size=480, fps_down=1, roi_head=None, roi_conf_threshold=0.5, model=None, **kw):
     """Run multi-target tracker on a particular sequence.
     """
     import tqdm
@@ -594,7 +806,12 @@ def run(src, vocab, out_file=True, size=480, fps_down=1, **kw):
 
     kw.setdefault('masks', True)
     # kw.setdefault('conf_threshold', 0.6)
-    model = Detic(['cat'], **kw).to(device)
+    model = Detic(config='LI', **kw).to(device) if model is None else model
+
+    if roi_head is not None and isinstance(roi_head, str):
+        # roi_head=model2 = Detic(checkpoint=roi_head, **kw).to(device)
+        # model2.set_vocab(['tortilla', 'jar', 'plate', 'cutting_board'])
+        roi_head = torch.load(roi_head)
 
     if isinstance(vocab, str) and os.path.isfile(vocab):
         d = np.load(vocab)
@@ -607,7 +824,7 @@ def run(src, vocab, out_file=True, size=480, fps_down=1, **kw):
     else:
         model.set_vocab(vocab)
 
-    classifier = model.predictor.model.roi_heads.box_predictor[0].cls_score.zs_weight
+    # classifier = model.predictor.model.roi_heads.box_predictor[0].cls_score.zs_weight
 
     # for h in model.predictor.model.roi_heads.box_predictor:
     #     h.cls_score.norm_temperature = 10
@@ -618,10 +835,10 @@ def run(src, vocab, out_file=True, size=480, fps_down=1, **kw):
     assert out_file
     print("Writing to:", os.path.abspath(out_file))
 
-    classes = model.labels
+    classes = model.labels = model.labels.astype(str)
     print("classes:", classes)
 
-    vis = Visualizer(model)
+    vis = Visualizer(model.labels)
     masks_on = model.cfg.MODEL.MASK_ON
     print("using masks:", masks_on)
 
@@ -633,18 +850,32 @@ def run(src, vocab, out_file=True, size=480, fps_down=1, **kw):
     # video_info = sv.VideoInfo.from_video_path(src)
     video_info, WH = get_video_info(src, size, fps_down)
     try:
-        replaced = [False]*len(classifier)
+        # replaced = [False]*len(classifier)
         with sv.VideoSink(out_file, video_info=video_info) as s, p:
             pbar = tqdm.tqdm(enumerate(sv.get_video_frames_generator(src)), total=video_info.total_frames)
             for i, frame in pbar:
+                # if i < 1070: continue
+                if i % fps_down: continue
                 # if i > 100: break
                 frame = cv2.resize(frame, WH)
-                outputs = model(frame, classifier)
+                query = model.build_query(frame)
+
+                outputs = query.detect()
+                # outputs = model(frame, classifier=classifier)
                 # bbox_unique, iv = model.group_proposals(bbox)
-                detections = vis.as_detections(outputs)
-                
-                pbar.set_description(f'{len(detections)}' + ', '.join(set(classes[i] for i in detections.class_id)) or 'nothing')
-                out_frame = vis.draw(frame.copy(), detections)
+                detections, labels = as_detections(outputs, model.labels)
+                pbar.set_description(f'{len(detections)}' + ', '.join(set(classes[i][:10] for i in detections.class_id)) or 'nothing')
+                out_frame = vis.draw(frame.copy(), detections, labels)
+
+                if roi_head is not None:
+                    # query = model2.build_query(frame)
+                    # outputs = query.detect(conf_threshold=roi_conf_threshold)#, roi_heads=roi_head
+                    outputs = query.detect(conf_threshold=roi_conf_threshold, roi_heads=roi_head, asymmetric_nms=True)
+                    detections, labels = as_detections(outputs, roi_head.labels)
+                    out_frame = vis.draw(out_frame, detections, labels)
+                    pbar.set_description(f'{len(detections)}' + ', '.join(set(
+                        roi_head.labels[i][:10] for i in detections.class_id)) or 'nothing')
+
                 s.write_frame(out_frame)
                 # if input():embed()
 
@@ -680,6 +911,7 @@ def get_video_info(src, size, fps_down=1, nrows=1, ncols=1):
     video_info = sv.VideoInfo.from_video_path(video_path=src)
     # make the video size a multiple of 16 (because otherwise it won't generate masks of the right size)
     aspect = video_info.width / video_info.height
+    size = size or video_info.height
     video_info.width = int(aspect*size)//16*16
     video_info.height = int(size)//16*16
     WH = video_info.width, video_info.height
