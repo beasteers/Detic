@@ -120,7 +120,7 @@ class DeticCascadeROIHeads(CascadeROIHeads):
         for i in range(len(proposals)):
             inst = Instances(proposals[i].image_size)
             inst.pred_boxes = Boxes(given_boxes[i].clone())
-            inst.all_scores = s = scores[i][:, :-1]
+            inst.pred_scores = s = scores[i][:, :-1]
             inst.scores, inst.pred_classes = torch.max(s, dim=1)
             inst.stage_scores = stage_scores[i][:, :-1]
             inst.stage_features = stage_features[i]
